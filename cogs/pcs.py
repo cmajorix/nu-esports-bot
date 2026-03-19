@@ -17,7 +17,7 @@ from utils import db
 GUILD_ID = config.secrets["discord"]["guild_id"]
 
 
-GGLEAP_BASE_URL = config.config["apis"]["ggleap"]
+GGLEAP_BASE_URL = config.secrets["apis"]["ggleap"]
 PCS_ENDPOINT = f"{GGLEAP_BASE_URL}/machines/uptime"
 RESERVATIONS_ENDPOINT = f"{GGLEAP_BASE_URL}/reservations"
 
@@ -759,7 +759,7 @@ class PCs(commands.Cog):
             os.path.join("assets", "fonts", "LibreFranklin-Bold.ttf"), 20
         )
         warning_font = load_font(
-            os.path.join("assets", "fonts", "LibreFranklin-Regular.ttf"), 16
+            os.path.join("assets", "fonts", "LibreFranklin-Regular.ttf"), 20
         )
 
         if not entries:
@@ -777,6 +777,10 @@ class PCs(commands.Cog):
         def text_size(text: str, font: ImageFont.ImageFont) -> Tuple[int, int]:
             left, top, right, bottom = probe_draw.textbbox((0, 0), text, font=font)
             return right - left, bottom - top
+
+        def text_metrics(text: str, font: ImageFont.ImageFont) -> Tuple[int, int, int]:
+            left, top, right, bottom = probe_draw.textbbox((0, 0), text, font=font)
+            return right - left, bottom - top, top
 
         square_size = 24
         square_gap = 8
@@ -830,10 +834,10 @@ class PCs(commands.Cog):
         draw = ImageDraw.Draw(img)
         icon_cache: Dict[Tuple[str, int, int], Image.Image] = {}
 
-        center_x = width // 2
-        squares_x = center_x - (center_cluster_width // 2)
-        left_square_x = squares_x
-        right_square_x = squares_x + square_size + square_gap
+        # Keep dedicated text columns on both sides of the PC icons.
+        # This avoids clipping when one side has much longer warning text.
+        left_square_x = side_padding + left_text_width + text_square_gap
+        right_square_x = left_square_x + square_size + square_gap
 
         def load_icon(color: str, pc_num: int) -> Image.Image | None:
             key = (color, pc_num, square_size)
@@ -864,11 +868,20 @@ class PCs(commands.Cog):
             main_text, warning_text = build_text_parts(entry)
             main_w = 0
             main_h = 0
+            main_top = 0
+            warning_w = 0
+            warning_h = 0
+            warning_top = 0
             if main_text:
-                main_w, main_h = text_size(main_text, main_font)
+                main_w, main_h, main_top = text_metrics(main_text, main_font)
             else:
-                _, main_h = text_size("Ag", main_font)
-            text_y = y + (row_height - main_h) // 2
+                _, main_h, main_top = text_metrics("Ag", main_font)
+            if warning_text:
+                warning_w, warning_h, warning_top = text_metrics(
+                    warning_text, warning_font
+                )
+
+            main_y = y + (row_height - main_h) // 2 - main_top
 
             if align_right:
                 main_x = left_anchor_x - main_w
@@ -876,12 +889,22 @@ class PCs(commands.Cog):
                 main_x = left_anchor_x
 
             if main_text:
-                draw.text((main_x, text_y), main_text, fill=text_color, font=main_font)
+                draw.text((main_x, main_y), main_text, fill=text_color, font=main_font)
 
             if warning_text:
-                warning_x = main_x + main_w + (0 if main_w == 0 else warning_gap)
+                gap = 0 if main_w == 0 else warning_gap
+                if align_right:
+                    warning_x = main_x - gap - warning_w
+                else:
+                    warning_x = main_x + main_w + gap
+                # Keep warning text on the same visual baseline as uptime text when both exist.
+                warning_y = (
+                    main_y
+                    if main_text
+                    else y + (row_height - warning_h) // 2 - warning_top
+                )
                 draw.text(
-                    (warning_x, text_y),
+                    (warning_x, warning_y),
                     warning_text,
                     fill=warning_color,
                     font=warning_font,
@@ -988,10 +1011,16 @@ class PCs(commands.Cog):
             return "red"
         return "default"
 
+    @staticmethod
+    def pcs_cooldown(ctx):
+        if ctx.author.id in STAFF_LIST:
+            return None
+        return commands.Cooldown(1, 300)
+
     @commands.slash_command(
         name="pcs", description="Show PC statuses as a color grid", guild_ids=[GUILD_ID]
     )
-    @commands.cooldown(1, 300, commands.BucketType.user)
+    @commands.dynamic_cooldown(pcs_cooldown, commands.BucketType.user)
     async def pcs(self, ctx):
         await ctx.defer()
         now = datetime.now(CENTRAL_TZ)
@@ -1649,7 +1678,7 @@ class PCs(commands.Cog):
         # Colors (Discord dark theme friendly)
         bg_color = (47, 49, 54)  # Discord dark background
         text_color = (220, 221, 222)  # Light gray text
-        grid_color = (60, 63, 68)  # Slightly lighter for grid lines
+        #grid_color = (60, 63, 68)  # Slightly lighter for grid lines
         available_color = (87, 242, 135)  # Green
         reserved_color = (155, 89, 182)  # Purple
         pending_color = (255, 165, 0)  # Orange
@@ -1707,9 +1736,9 @@ class PCs(commands.Cog):
 
                 # Draw filled rectangle
                 draw.rectangle(
-                    [x, y, x + cell_size - 2, y + cell_size - 2],
+                    [x, y+2, x + cell_size - 2 + 1, y + cell_size - 2],
                     fill=color,
-                    outline=grid_color,
+                #   outline=grid_color,
                 )
 
         # Save to BytesIO
@@ -1911,9 +1940,12 @@ class ReservationTimeModal(discord.ui.Modal):
                 )
                 embed.add_field(name="Team", value=self.team, inline=False)
                 embed.add_field(name="Res Type", value=self.res_type, inline=False)
+                manager_email = "Email not found"
+                if isinstance(GAME_HEAD_EMAILS, dict):
+                    manager_email = GAME_HEAD_EMAILS.get(manager, "Email not found")
                 embed.add_field(
                     name="Manager Email",
-                    value=GAME_HEAD_EMAILS.get(manager, "Email not found"),
+                    value=manager_email,
                     inline=False,
                 )
                 embed.add_field(name="Manager", value=manager, inline=False)
